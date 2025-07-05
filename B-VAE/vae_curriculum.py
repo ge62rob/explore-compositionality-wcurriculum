@@ -5,12 +5,13 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, SequentialSampler
+from torch.utils.data import DataLoader, SequentialSampler, Sampler
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import matplotlib.pyplot as plt
 from torchvision.utils import save_image
 from torch_fidelity import calculate_metrics  # This uses Inception V3 internally
+from datetime import datetime
 
 ##############################################
 # 1. Define the VAE Architecture
@@ -86,6 +87,53 @@ def vae_loss(x_recon, x, mu, logvar, beta=1.0, pos_weight=7.593):
 ##############################################
 # 3. Curriculum Learning DataLoader Based on Folder Structure
 ##############################################
+class CurriculumSampler(Sampler):
+    def __init__(self, dataset, curriculum_mode="forward"):
+        self.dataset = dataset
+        self.curriculum_mode = curriculum_mode
+        
+        # Extract piece numbers from class names (e.g., "tangrams_1_piece" -> 1)
+        self.class_to_pieces = {
+            idx: int(name.split('_')[1]) 
+            for idx, name in enumerate(dataset.classes)
+        }
+        
+        # Create mapping of indices based on curriculum mode
+        self.indices = list(range(len(dataset)))
+        if curriculum_mode != "mixed":
+            self.indices = self._sort_indices()
+            
+    def _sort_indices(self):
+        # Sort indices based on piece count
+        sorted_indices = []
+        piece_to_indices = {}
+        
+        # Group indices by piece count
+        for idx in self.indices:
+            class_idx = self.dataset.targets[idx]
+            piece_count = self.class_to_pieces[class_idx]
+            if piece_count not in piece_to_indices:
+                piece_to_indices[piece_count] = []
+            piece_to_indices[piece_count].append(idx)
+        
+        # Sort piece counts based on curriculum mode
+        piece_counts = sorted(piece_to_indices.keys(), 
+                            reverse=(self.curriculum_mode == "reverse"))
+        
+        # Create final sorted list
+        for piece_count in piece_counts:
+            sorted_indices.extend(piece_to_indices[piece_count])
+            
+        return sorted_indices
+    
+    def __iter__(self):
+        if self.curriculum_mode == "mixed":
+            return iter(torch.randperm(len(self.dataset)).tolist())
+        return iter(self.indices)
+    
+    def __len__(self):
+        return len(self.dataset)
+
 def get_curriculum_dataloader(dataset, batch_size, curriculum_mode="mixed", 
                               num_workers=16, pin_memory=True, persistent_workers=True, prefetch_factor=16):
     """
@@ -94,29 +142,16 @@ def get_curriculum_dataloader(dataset, batch_size, curriculum_mode="mixed",
       - "reverse": loads images in reverse order (tangram_7_piece first, down to tangram_1_piece).
       - "mixed": uses random shuffling.
     """
-    if curriculum_mode == "mixed":
-        return DataLoader(dataset, batch_size=batch_size, shuffle=True,
-                          num_workers=num_workers, pin_memory=pin_memory,
-                          persistent_workers=persistent_workers, prefetch_factor=prefetch_factor)
+    # Create appropriate sampler
+    sampler = CurriculumSampler(dataset, curriculum_mode)
     
-    # Debug: print class indices and names.
-    class_indices = sorted(set(idx for _, idx in dataset.samples))
-    print(f"\nClass indices in dataset: {class_indices}")
-    print(f"Class names: {dataset.classes}")
+    # Debug: print first few samples
+    print(f"\nFirst few samples in {curriculum_mode} curriculum:")
+    for i in range(min(3, len(sampler))):
+        idx = list(iter(sampler))[i]
+        class_idx = dataset.targets[idx]
+        print(f"Sample {i+1}: {dataset.classes[class_idx]}")
     
-    if curriculum_mode == "forward":
-        indices = sorted(range(len(dataset)), key=lambda i: dataset.samples[i][1])
-        print(f"Forward curriculum order (first 3): {[dataset.classes[dataset.samples[i][1]] for i in indices[:3]]}")
-    elif curriculum_mode == "reverse":
-        reversed_class_indices = sorted(class_indices, reverse=True)
-        print(f"Reversed class indices: {reversed_class_indices}")
-        class_to_position = {idx: pos for pos, idx in enumerate(reversed_class_indices)}
-        indices = sorted(range(len(dataset)), key=lambda i: class_to_position[dataset.samples[i][1]])
-        print(f"Reverse curriculum order (first 3): {[dataset.classes[dataset.samples[i][1]] for i in indices[:3]]}")
-    else:
-        raise ValueError("Unknown curriculum mode. Use 'forward', 'reverse', or 'mixed'.")
-    
-    sampler = SequentialSampler(indices)
     return DataLoader(dataset, batch_size=batch_size, sampler=sampler,
                       num_workers=num_workers, pin_memory=pin_memory,
                       persistent_workers=persistent_workers, prefetch_factor=prefetch_factor)
@@ -229,7 +264,13 @@ def train_curriculum_model(curriculum_mode, dataset, device, num_epochs=1000, ba
                            learning_rate=1e-3, latent_dim=128, pos_weight=7.593, warmup_epochs=100,
                            eval_every=50):
     print(f"\n=== Training with '{curriculum_mode}' curriculum ===")
-    log_file = f"training_logs_{curriculum_mode}.txt"
+    
+    # Generate unique timestamped folder name
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_folder = f"training_logs_{curriculum_mode}_{timestamp}"
+    os.makedirs(log_folder, exist_ok=True)
+    
+    log_file = os.path.join(log_folder, f"training_logs_{curriculum_mode}.txt")
     with open(log_file, "w") as f:
         f.write("epoch,loss,beta,fid\n")
         f.flush()
@@ -283,7 +324,7 @@ def train_curriculum_model(curriculum_mode, dataset, device, num_epochs=1000, ba
                 f.write("\n")
                 f.flush()
                 
-    model_save_path = f"vae_tangram_{curriculum_mode}.pth"
+    model_save_path = os.path.join(log_folder, f"vae_tangram_{curriculum_mode}_{timestamp}.pth")
     logs = {
         "epochs": log_epochs,
         "losses": log_losses,
@@ -318,7 +359,7 @@ if __name__ == '__main__':
     
     curriculum_modes = ["reverse", "forward", "mixed"]
     
-    transform = transforms.Compose([
+    transform = transforms.Compose([ 
         transforms.Grayscale(num_output_channels=1),
         transforms.Resize((img_size, img_size)),
         transforms.ToTensor(),
