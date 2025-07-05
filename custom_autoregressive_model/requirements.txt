@@ -1,0 +1,6 @@
+torch>=1.7.0
+torchvision>=0.8.1
+pillow>=8.0.0
+numpy>=1.19.0
+matplotlib>=3.3.0
+shapely>=1.7.0 
